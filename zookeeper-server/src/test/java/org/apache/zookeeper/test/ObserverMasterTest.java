@@ -47,6 +47,7 @@ import javax.management.ReflectionException;
 import javax.management.RuntimeMBeanException;
 import org.apache.zookeeper.AsyncCallback;
 import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.DummyWatcher;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.ConnectionLossException;
 import org.apache.zookeeper.PortAssignment;
@@ -229,11 +230,11 @@ public class ObserverMasterTest extends QuorumPeerTestBase implements Watcher {
         zk.create("/target1", "third".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
         zk.create("/target2", "third".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
 
-        LOG.info("observer zxid "
-                         + Long.toHexString(q3.getQuorumPeer().getLastLoggedZxid())
-                         + (testObserverMaster ? "" : " observer master zxid " + Long.toHexString(follower.getQuorumPeer().getLastLoggedZxid()))
-                         + " leader zxid "
-                         + Long.toHexString(leader.getQuorumPeer().getLastLoggedZxid()));
+        LOG.info(
+            "observer zxid {}{} leader zxid {}",
+            Long.toHexString(q3.getQuorumPeer().getLastLoggedZxid()),
+            (testObserverMaster ? "" : " observer master zxid " + Long.toHexString(follower.getQuorumPeer().getLastLoggedZxid())),
+            Long.toHexString(leader.getQuorumPeer().getLastLoggedZxid()));
 
         // restore network
         forwarder = testObserverMaster ? new PortForwarder(OM_PROXY_PORT, OM_PORT) : null;
@@ -286,7 +287,7 @@ public class ObserverMasterTest extends QuorumPeerTestBase implements Watcher {
 
         if (testObserverMaster) {
             int masterPort = q3.getQuorumPeer().observer.getSocket().getPort();
-            LOG.info("port " + masterPort + " " + OM_PORT);
+            LOG.info("port {} {}", masterPort, OM_PORT);
             assertEquals("observer failed to connect to observer master", masterPort, OM_PORT);
         }
 
@@ -590,11 +591,7 @@ public class ObserverMasterTest extends QuorumPeerTestBase implements Watcher {
         ZooKeeperAdmin admin = new ZooKeeperAdmin(
             "127.0.0.1:" + clientPort,
             ClientBase.CONNECTION_TIMEOUT,
-            new Watcher() {
-                public void process(WatchedEvent event) {
-
-                }
-            });
+            DummyWatcher.INSTANCE);
         admin.addAuthInfo("digest", "super:test".getBytes());
         return admin;
     }
@@ -648,14 +645,11 @@ public class ObserverMasterTest extends QuorumPeerTestBase implements Watcher {
         ZooKeeper observerClient = new ZooKeeper(
             "127.0.0.1:" + observerClientPort,
             ClientBase.CONNECTION_TIMEOUT,
-            new Watcher() {
-                @Override
-                public void process(WatchedEvent event) {
-                    try {
-                        states.put(event.getState());
-                    } catch (InterruptedException e) {
+            event -> {
+                try {
+                    states.put(event.getState());
+                } catch (InterruptedException ignore) {
 
-                    }
                 }
             });
 
@@ -693,7 +687,7 @@ public class ObserverMasterTest extends QuorumPeerTestBase implements Watcher {
         if (latch != null) {
             latch.countDown();
         }
-        LOG.info("Latch got event :: " + event);
+        LOG.info("Latch got event :: {}", event);
     }
 
     class AsyncWriter implements Runnable {

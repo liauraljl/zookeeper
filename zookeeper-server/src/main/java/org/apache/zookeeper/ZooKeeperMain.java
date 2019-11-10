@@ -38,6 +38,7 @@ import java.util.regex.Pattern;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.admin.ZooKeeperAdmin;
 import org.apache.zookeeper.cli.AddAuthCommand;
+import org.apache.zookeeper.cli.AddWatchCommand;
 import org.apache.zookeeper.cli.CliCommand;
 import org.apache.zookeeper.cli.CliException;
 import org.apache.zookeeper.cli.CloseCommand;
@@ -123,6 +124,7 @@ public class ZooKeeperMain {
         new GetEphemeralsCommand().addToMap(commandMapCli);
         new GetAllChildrenNumberCommand().addToMap(commandMapCli);
         new VersionCommand().addToMap(commandMapCli);
+        new AddWatchCommand().addToMap(commandMapCli);
 
         // add all to commandMap
         for (Entry<String, CliCommand> entry : commandMapCli.entrySet()) {
@@ -328,19 +330,12 @@ public class ZooKeeperMain {
                 while ((line = (String) readLine.invoke(console, getPrompt())) != null) {
                     executeLine(line);
                 }
-            } catch (ClassNotFoundException e) {
-                LOG.debug("Unable to start jline", e);
-                jlinemissing = true;
-            } catch (NoSuchMethodException e) {
-                LOG.debug("Unable to start jline", e);
-                jlinemissing = true;
-            } catch (InvocationTargetException e) {
-                LOG.debug("Unable to start jline", e);
-                jlinemissing = true;
-            } catch (IllegalAccessException e) {
-                LOG.debug("Unable to start jline", e);
-                jlinemissing = true;
-            } catch (InstantiationException e) {
+            } catch (ClassNotFoundException
+                | NoSuchMethodException
+                | InvocationTargetException
+                | IllegalAccessException
+                | InstantiationException e
+            ) {
                 LOG.debug("Unable to start jline", e);
                 jlinemissing = true;
             }
@@ -396,6 +391,7 @@ public class ZooKeeperMain {
         }
 
         boolean watch = false;
+
         LOG.debug("Processing {}", cmd);
 
         if (cmd.equals("quit")) {

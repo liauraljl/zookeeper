@@ -56,14 +56,15 @@ import org.apache.zookeeper.common.PathTrie;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.data.StatPersisted;
-import org.apache.zookeeper.server.util.DigestCalculator;
 import org.apache.zookeeper.server.watch.IWatchManager;
 import org.apache.zookeeper.server.watch.WatchManagerFactory;
+import org.apache.zookeeper.server.watch.WatcherMode;
 import org.apache.zookeeper.server.watch.WatcherOrBitSet;
 import org.apache.zookeeper.server.watch.WatchesPathReport;
 import org.apache.zookeeper.server.watch.WatchesReport;
 import org.apache.zookeeper.server.watch.WatchesSummary;
 import org.apache.zookeeper.txn.CheckVersionTxn;
+import org.apache.zookeeper.txn.CloseSessionTxn;
 import org.apache.zookeeper.txn.CreateContainerTxn;
 import org.apache.zookeeper.txn.CreateTTLTxn;
 import org.apache.zookeeper.txn.CreateTxn;
@@ -96,7 +97,7 @@ public class DataTree {
      * This map provides a fast lookup to the datanodes. The tree is the
      * source of truth and is where all the locking occurs
      */
-    private final NodeHashMap nodes = new NodeHashMapImpl();
+    private final NodeHashMap nodes;
 
     private IWatchManager dataWatches;
 
@@ -178,6 +179,8 @@ public class DataTree {
 
     // The historical digests list.
     private LinkedList<ZxidDigest> digestLog = new LinkedList<>();
+
+    private final DigestCalculator digestCalculator;
 
     @SuppressWarnings("unchecked")
     public Set<String> getEphemerals(long sessionId) {
@@ -269,6 +272,13 @@ public class DataTree {
     private final DataNode quotaDataNode = new DataNode(new byte[0], -1L, new StatPersisted());
 
     public DataTree() {
+        this(new DigestCalculator());
+    }
+
+    DataTree(DigestCalculator digestCalculator) {
+        this.digestCalculator = digestCalculator;
+        nodes = new NodeHashMapImpl(digestCalculator);
+
         /* Rather than fight it, let root have an alias */
         nodes.put("", root);
         nodes.putWithoutDigest(rootZookeeper, root);
@@ -287,7 +297,7 @@ public class DataTree {
             dataWatches = WatchManagerFactory.createWatchManager();
             childWatches = WatchManagerFactory.createWatchManager();
         } catch (Exception e) {
-            LOG.error("Unexpected exception when creating WatchManager, " + "exiting abnormally", e);
+            LOG.error("Unexpected exception when creating WatchManager, exiting abnormally", e);
             System.exit(ExitCode.UNEXPECTED_ERROR.getValue());
         }
     }
@@ -370,7 +380,7 @@ public class DataTree {
         StatsTrack updatedStat = null;
         if (node == null) {
             // should not happen
-            LOG.error("Missing count node for stat " + statNode);
+            LOG.error("Missing count node for stat {}", statNode);
             return;
         }
         synchronized (node) {
@@ -385,21 +395,25 @@ public class DataTree {
         StatsTrack thisStats = null;
         if (node == null) {
             // should not happen
-            LOG.error("Missing count node for quota " + quotaNode);
+            LOG.error("Missing count node for quota {}", quotaNode);
             return;
         }
         synchronized (node) {
             thisStats = new StatsTrack(new String(node.data));
         }
         if (thisStats.getCount() > -1 && (thisStats.getCount() < updatedStat.getCount())) {
-            LOG.warn("Quota exceeded: " + lastPrefix
-                     + " count=" + updatedStat.getCount()
-                     + " limit=" + thisStats.getCount());
+            LOG.warn(
+                "Quota exceeded: {} count={} limit={}",
+                lastPrefix,
+                updatedStat.getCount(),
+                thisStats.getCount());
         }
         if (thisStats.getBytes() > -1 && (thisStats.getBytes() < updatedStat.getBytes())) {
-            LOG.warn("Quota exceeded: " + lastPrefix
-                     + " bytes=" + updatedStat.getBytes()
-                     + " limit=" + thisStats.getBytes());
+            LOG.warn(
+                "Quota exceeded: {} bytes={} limit={}",
+                lastPrefix,
+                updatedStat.getBytes(),
+                thisStats.getBytes());
         }
     }
 
@@ -633,6 +647,7 @@ public class DataTree {
                 ZooTrace.EVENT_DELIVERY_TRACE_MASK,
                 "childWatches.triggerWatch " + parentName);
         }
+
         WatcherOrBitSet processed = dataWatches.triggerWatch(path, EventType.NodeDeleted);
         childWatches.triggerWatch(path, EventType.NodeDeleted, processed);
         childWatches.triggerWatch("".equals(parentName) ? "/" : parentName, EventType.NodeChildrenChanged);
@@ -685,6 +700,12 @@ public class DataTree {
         } else {
             return lastPrefix;
         }
+    }
+
+    public void addWatch(String basePath, Watcher watcher, int mode) {
+        WatcherMode watcherMode = WatcherMode.fromZooDef(mode);
+        dataWatches.addWatch(basePath, watcher, watcherMode);
+        childWatches.addWatch(basePath, watcher, watcherMode);
     }
 
     public byte[] getData(String path, Stat stat, Watcher watcher) throws KeeperException.NoNodeException {
@@ -939,7 +960,14 @@ public class DataTree {
                 rc.stat = setACL(setACLTxn.getPath(), setACLTxn.getAcl(), setACLTxn.getVersion());
                 break;
             case OpCode.closeSession:
-                killSession(header.getClientId(), header.getZxid());
+                long sessionId = header.getClientId();
+                if (txn != null) {
+                    killSession(sessionId, header.getZxid(),
+                            ephemerals.remove(sessionId),
+                            ((CloseSessionTxn) txn).getPaths2Delete());
+                } else {
+                    killSession(sessionId, header.getZxid());
+                }
                 break;
             case OpCode.error:
                 ErrorTxn errTxn = (ErrorTxn) txn;
@@ -1027,15 +1055,19 @@ public class DataTree {
         }
 
         /*
-         * Snapshots are taken lazily. It can happen that the child
-         * znodes of a parent are created after the parent
-         * is serialized. Therefore, while replaying logs during restore, a
-         * create might fail because the node was already
-         * created.
+         * Snapshots are taken lazily. When serializing a node, it's data
+         * and children copied in a synchronization block on that node,
+         * which means newly created node won't be in the snapshot, so
+         * we won't have mismatched cversion and pzxid when replaying the
+         * createNode txn.
          *
-         * After seeing this failure, we should increment
-         * the cversion of the parent znode since the parent was serialized
-         * before its children.
+         * But there is a tricky scenario that if the child is deleted due
+         * to session close and re-created in a different global session
+         * after that the parent is serialized, then when replay the txn
+         * because the node is belonging to a different session, replay the
+         * closeSession txn won't delete it anymore, and we'll get NODEEXISTS
+         * error when replay the createNode txn. In this case, we need to
+         * update the cversion and pzxid to the new value.
          *
          * Note, such failures on DT should be seen only during
          * restore.
@@ -1048,7 +1080,7 @@ public class DataTree {
             try {
                 setCversionPzxid(parentName, cTxn.getParentCVersion(), header.getZxid());
             } catch (KeeperException.NoNodeException e) {
-                LOG.error("Failed to set parent cversion for: " + parentName, e);
+                LOG.error("Failed to set parent cversion for: {}", parentName, e);
                 rc.err = e.code().intValue();
             }
         } else if (rc.err != Code.OK.intValue()) {
@@ -1107,20 +1139,46 @@ public class DataTree {
         // so there is no need for synchronization. The list is not
         // changed here. Only create and delete change the list which
         // are again called from FinalRequestProcessor in sequence.
-        Set<String> list = ephemerals.remove(session);
-        if (list != null) {
-            for (String path : list) {
-                try {
-                    deleteNode(path, zxid);
-                    if (LOG.isDebugEnabled()) {
-                        LOG.debug("Deleting ephemeral node " + path + " for session 0x" + Long.toHexString(session));
-                    }
-                } catch (NoNodeException e) {
-                    LOG.warn("Ignoring NoNodeException for path "
-                             + path
-                             + " while removing ephemeral for dead session 0x"
-                             + Long.toHexString(session));
-                }
+        killSession(session, zxid, ephemerals.remove(session), null);
+    }
+
+    void killSession(long session, long zxid, Set<String> paths2DeleteLocal,
+            List<String> paths2DeleteInTxn) {
+        if (paths2DeleteInTxn != null) {
+            deleteNodes(session, zxid, paths2DeleteInTxn);
+        }
+
+        if (paths2DeleteLocal == null) {
+            return;
+        }
+
+        if (paths2DeleteInTxn != null) {
+            // explicitly check and remove to avoid potential performance
+            // issue when using removeAll
+            for (String path: paths2DeleteInTxn) {
+                paths2DeleteLocal.remove(path);
+            }
+            if (!paths2DeleteLocal.isEmpty()) {
+                LOG.warn(
+                    "Unexpected extra paths under session {} which are not in txn 0x{}",
+                    paths2DeleteLocal,
+                    Long.toHexString(zxid));
+            }
+        }
+
+        deleteNodes(session, zxid, paths2DeleteLocal);
+    }
+
+    void deleteNodes(long session, long zxid, Iterable<String> paths2Delete) {
+        for (String path : paths2Delete) {
+            try {
+                deleteNode(path, zxid);
+                LOG.debug("Deleting ephemeral node {} for session 0x{}", path, Long.toHexString(session));
+            } catch (NoNodeException e) {
+                LOG.warn(
+                    "Ignoring NoNodeException for path {} while removing ephemeral for dead session 0x{}",
+                    path,
+                    Long.toHexString(session));
             }
         }
     }
@@ -1179,7 +1237,7 @@ public class DataTree {
         DataNode node = getNode(statPath);
         // it should exist
         if (node == null) {
-            LOG.warn("Missing quota stat node " + statPath);
+            LOG.warn("Missing quota stat node {}", statPath);
             return;
         }
         synchronized (node) {
@@ -1448,7 +1506,8 @@ public class DataTree {
         childWatches.removeWatcher(watcher);
     }
 
-    public void setWatches(long relativeZxid, List<String> dataWatches, List<String> existWatches, List<String> childWatches, Watcher watcher) {
+    public void setWatches(long relativeZxid, List<String> dataWatches, List<String> existWatches, List<String> childWatches,
+                           List<String> persistentWatches, List<String> persistentRecursiveWatches, Watcher watcher) {
         for (String path : dataWatches) {
             DataNode node = getNode(path);
             WatchedEvent e = null;
@@ -1477,6 +1536,14 @@ public class DataTree {
             } else {
                 this.childWatches.addWatch(path, watcher);
             }
+        }
+        for (String path : persistentWatches) {
+            this.childWatches.addWatch(path, watcher, WatcherMode.PERSISTENT);
+            this.dataWatches.addWatch(path, watcher, WatcherMode.PERSISTENT);
+        }
+        for (String path : persistentRecursiveWatches) {
+            this.childWatches.addWatch(path, watcher, WatcherMode.PERSISTENT_RECURSIVE);
+            this.dataWatches.addWatch(path, watcher, WatcherMode.PERSISTENT_RECURSIVE);
         }
     }
 
@@ -1590,7 +1657,7 @@ public class DataTree {
      * Add the digest to the historical list, and update the latest zxid digest.
      */
     private void logZxidDigest(long zxid, long digest) {
-        ZxidDigest zxidDigest = new ZxidDigest(zxid, DigestCalculator.DIGEST_VERSION, digest);
+        ZxidDigest zxidDigest = new ZxidDigest(zxid, digestCalculator.getDigestVersion(), digest);
         lastProcessedZxidDigest = zxidDigest;
         if (zxidDigest.zxid % DIGEST_LOG_INTERVAL == 0) {
             synchronized (digestLog) {
@@ -1611,7 +1678,7 @@ public class DataTree {
      * @return true if the digest is serialized successfully
      */
     public boolean serializeZxidDigest(OutputArchive oa) throws IOException {
-        if (!DigestCalculator.digestEnabled()) {
+        if (!ZooKeeperServer.isDigestEnabled()) {
             return false;
         }
 
@@ -1632,7 +1699,7 @@ public class DataTree {
      * @return the true if it deserialized successfully
      */
     public boolean deserializeZxidDigest(InputArchive ia) throws IOException {
-        if (!DigestCalculator.digestEnabled()) {
+        if (!ZooKeeperServer.isDigestEnabled()) {
             return false;
         }
 
@@ -1644,7 +1711,7 @@ public class DataTree {
             }
             return true;
         } catch (EOFException e) {
-            LOG.warn("Got EOF exception while reading the digest, " + "likely due to the reading an older snapshot.");
+            LOG.warn("Got EOF exception while reading the digest, likely due to the reading an older snapshot.");
             return false;
         }
     }
@@ -1657,9 +1724,11 @@ public class DataTree {
      */
     public void compareSnapshotDigests(long zxid) {
         if (zxid == digestFromLoadedSnapshot.zxid) {
-            if (DigestCalculator.DIGEST_VERSION != digestFromLoadedSnapshot.digestVersion) {
-                LOG.info("Digest version changed, local: {}, new: {}, "
-                         + "skip comparing digest now.", digestFromLoadedSnapshot.digestVersion, DigestCalculator.DIGEST_VERSION);
+            if (digestCalculator.getDigestVersion() != digestFromLoadedSnapshot.digestVersion) {
+                LOG.info(
+                    "Digest version changed, local: {}, new: {}, skip comparing digest now.",
+                    digestFromLoadedSnapshot.digestVersion,
+                    digestCalculator.getDigestVersion());
                 digestFromLoadedSnapshot = null;
                 return;
             }
@@ -1668,8 +1737,9 @@ public class DataTree {
             }
             digestFromLoadedSnapshot = null;
         } else if (digestFromLoadedSnapshot.zxid != 0 && zxid > digestFromLoadedSnapshot.zxid) {
-            LOG.error("Watching for zxid 0x{} during snapshot recovery, but it wasn't found.",
-                      Long.toHexString(digestFromLoadedSnapshot.zxid));
+            LOG.error(
+                "Watching for zxid 0x{} during snapshot recovery, but it wasn't found.",
+                Long.toHexString(digestFromLoadedSnapshot.zxid));
         }
     }
 
@@ -1718,10 +1788,9 @@ public class DataTree {
     }
 
     /**
-     * A helper class to maintain the digest meta associated with specific
-     * zxid.
+     * A helper class to maintain the digest meta associated with specific zxid.
      */
-    public static class ZxidDigest {
+    public class ZxidDigest {
 
         long zxid;
         // the digest value associated with this zxid
@@ -1730,7 +1799,7 @@ public class DataTree {
         int digestVersion;
 
         ZxidDigest() {
-            this(0, DigestCalculator.DIGEST_VERSION, 0);
+            this(0, digestCalculator.getDigestVersion(), 0);
         }
 
         ZxidDigest(long zxid, int digestVersion, long digest) {

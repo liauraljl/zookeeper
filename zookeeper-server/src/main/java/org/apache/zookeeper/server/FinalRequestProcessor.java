@@ -21,6 +21,7 @@ package org.apache.zookeeper.server;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -47,9 +48,11 @@ import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.proto.AddWatchRequest;
 import org.apache.zookeeper.proto.CheckWatchesRequest;
 import org.apache.zookeeper.proto.Create2Response;
 import org.apache.zookeeper.proto.CreateResponse;
+import org.apache.zookeeper.proto.ErrorResponse;
 import org.apache.zookeeper.proto.ExistsRequest;
 import org.apache.zookeeper.proto.ExistsResponse;
 import org.apache.zookeeper.proto.GetACLRequest;
@@ -69,14 +72,13 @@ import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.SetACLResponse;
 import org.apache.zookeeper.proto.SetDataResponse;
 import org.apache.zookeeper.proto.SetWatches;
+import org.apache.zookeeper.proto.SetWatches2;
 import org.apache.zookeeper.proto.SyncRequest;
 import org.apache.zookeeper.proto.SyncResponse;
 import org.apache.zookeeper.server.DataTree.ProcessTxnResult;
-import org.apache.zookeeper.server.ZooKeeperServer.ChangeRecord;
 import org.apache.zookeeper.server.quorum.QuorumZooKeeperServer;
 import org.apache.zookeeper.server.util.RequestPathMetricsCollector;
 import org.apache.zookeeper.txn.ErrorTxn;
-import org.apache.zookeeper.txn.TxnHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -113,33 +115,8 @@ public class FinalRequestProcessor implements RequestProcessor {
         if (LOG.isTraceEnabled()) {
             ZooTrace.logRequest(LOG, traceMask, 'E', request, "");
         }
-        ProcessTxnResult rc = null;
-        synchronized (zks.outstandingChanges) {
-            // Need to process local session requests
-            rc = zks.processTxn(request);
 
-            // request.hdr is set for write requests, which are the only ones
-            // that add to outstandingChanges.
-            if (request.getHdr() != null) {
-                TxnHeader hdr = request.getHdr();
-                long zxid = hdr.getZxid();
-                while (!zks.outstandingChanges.isEmpty() && zks.outstandingChanges.peek().zxid <= zxid) {
-                    ChangeRecord cr = zks.outstandingChanges.remove();
-                    ServerMetrics.getMetrics().OUTSTANDING_CHANGES_REMOVED.add(1);
-                    if (cr.zxid < zxid) {
-                        LOG.warn("Zxid outstanding " + cr.zxid + " is less than current " + zxid);
-                    }
-                    if (zks.outstandingChangesForPath.get(cr.path) == cr) {
-                        zks.outstandingChangesForPath.remove(cr.path);
-                    }
-                }
-            }
-
-            // do not add non quorum packets to the queue.
-            if (request.isQuorum()) {
-                zks.getZKDatabase().addCommittedProposal(request);
-            }
-        }
+        ProcessTxnResult rc = zks.processTxn(request);
 
         // ZOOKEEPER-558:
         // In some cases the server does not close the connection (e.g., closeconn buffer
@@ -179,7 +156,10 @@ public class FinalRequestProcessor implements RequestProcessor {
         long lastZxid = zks.getZKDatabase().getDataTreeLastProcessedZxid();
 
         String lastOp = "NA";
+        // Notify ZooKeeperServer that the request has finished so that it can
+        // update any request accounting/throttling limits
         zks.decInProcess();
+        zks.requestFinished(request);
         Code err = Code.OK;
         Record rsp = null;
         String path = null;
@@ -389,7 +369,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             case OpCode.setWatches: {
                 lastOp = "SETW";
                 SetWatches setWatches = new SetWatches();
-                // TODO We really should NOT need this!!!!
+                // TODO we really should not need this
                 request.request.rewind();
                 ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
                 long relativeZxid = setWatches.getRelativeZxid();
@@ -399,7 +379,34 @@ public class FinalRequestProcessor implements RequestProcessor {
                        setWatches.getDataWatches(),
                        setWatches.getExistWatches(),
                        setWatches.getChildWatches(),
+                       Collections.emptyList(),
+                       Collections.emptyList(),
                        cnxn);
+                break;
+            }
+            case OpCode.setWatches2: {
+                lastOp = "STW2";
+                SetWatches2 setWatches = new SetWatches2();
+                // TODO we really should not need this
+                request.request.rewind();
+                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                long relativeZxid = setWatches.getRelativeZxid();
+                zks.getZKDatabase().setWatches(relativeZxid,
+                        setWatches.getDataWatches(),
+                        setWatches.getExistWatches(),
+                        setWatches.getChildWatches(),
+                        setWatches.getPersistentWatches(),
+                        setWatches.getPersistentRecursiveWatches(),
+                        cnxn);
+                break;
+            }
+            case OpCode.addWatch: {
+                lastOp = "ADDW";
+                AddWatchRequest addWatcherRequest = new AddWatchRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request,
+                        addWatcherRequest);
+                zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
+                rsp = new ErrorResponse(0);
                 break;
             }
             case OpCode.getACL: {
@@ -560,14 +567,14 @@ public class FinalRequestProcessor implements RequestProcessor {
         } catch (Exception e) {
             // log at error level as we are returning a marshalling
             // error to the user
-            LOG.error("Failed to process " + request, e);
+            LOG.error("Failed to process {}", request, e);
             StringBuilder sb = new StringBuilder();
             ByteBuffer bb = request.request;
             bb.rewind();
             while (bb.hasRemaining()) {
                 sb.append(Integer.toHexString(bb.get() & 0xff));
             }
-            LOG.error("Dumping request buffer: 0x" + sb.toString());
+            LOG.error("Dumping request buffer: 0x{}", sb.toString());
             err = Code.MARSHALLINGERROR;
         }
 

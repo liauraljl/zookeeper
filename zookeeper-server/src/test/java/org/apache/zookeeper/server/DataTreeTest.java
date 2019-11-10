@@ -24,12 +24,14 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Field;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,18 +41,13 @@ import org.apache.jute.Record;
 import org.apache.zookeeper.KeeperException.NoNodeException;
 import org.apache.zookeeper.KeeperException.NodeExistsException;
 import org.apache.zookeeper.Quotas;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.common.PathTrie;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.metrics.MetricsUtils;
-import org.apache.zookeeper.server.util.DigestCalculator;
 import org.apache.zookeeper.txn.CreateTxn;
 import org.apache.zookeeper.txn.TxnHeader;
-import org.junit.After;
-import org.junit.Before;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,18 +55,6 @@ import org.slf4j.LoggerFactory;
 public class DataTreeTest extends ZKTestCase {
 
     protected static final Logger LOG = LoggerFactory.getLogger(DataTreeTest.class);
-
-    private DataTree dt;
-
-    @Before
-    public void setUp() throws Exception {
-        dt = new DataTree();
-    }
-
-    @After
-    public void tearDown() throws Exception {
-        dt = null;
-    }
 
     /**
      * For ZOOKEEPER-1755 - Test race condition when taking dumpEphemerals and
@@ -121,22 +106,20 @@ public class DataTreeTest extends ZKTestCase {
 
     @Test(timeout = 60000)
     public void testRootWatchTriggered() throws Exception {
-        class MyWatcher implements Watcher {
+        DataTree dt = new DataTree();
 
-            boolean fired = false;
-            public void process(WatchedEvent event) {
-                if (event.getPath().equals("/")) {
-                    fired = true;
-                }
-            }
-
-        }
-        MyWatcher watcher = new MyWatcher();
+        CompletableFuture<Void> fire = new CompletableFuture<>();
         // set a watch on the root node
-        dt.getChildren("/", new Stat(), watcher);
+        dt.getChildren("/", new Stat(), event -> {
+            if (event.getPath().equals("/")) {
+                fire.complete(null);
+            }
+        });
+
         // add a new node, should trigger a watch
         dt.createNode("/xyz", new byte[0], null, 0, dt.getNode("/").stat.getCversion() + 1, 1, 1);
-        assertFalse("Root node watch not triggered", !watcher.fired);
+
+        assertTrue("Root node watch not triggered", fire.isDone());
     }
 
     /**
@@ -145,7 +128,8 @@ public class DataTreeTest extends ZKTestCase {
     @Test(timeout = 60000)
     public void testIncrementCversion() throws Exception {
         try {
-            DigestCalculator.setDigestEnabled(true);
+            // digestCalculator gets initialized for the new DataTree constructor based on the system property
+            ZooKeeperServer.setDigestEnabled(true);
             DataTree dt = new DataTree();
             dt.createNode("/test", new byte[0], null, 0, dt.getNode("/").stat.getCversion() + 1, 1, 1);
             DataNode zk = dt.getNode("/test");
@@ -166,12 +150,13 @@ public class DataTreeTest extends ZKTestCase {
                                       + ">", (newCversion == prevCversion + 1 && newPzxid == prevPzxid + 1));
             assertNotEquals(digestBefore, dt.getTreeDigest());
         } finally {
-            DigestCalculator.setDigestEnabled(false);
+            ZooKeeperServer.setDigestEnabled(false);
         }
     }
 
     @Test
     public void testNoCversionRevert() throws Exception {
+        DataTree dt = new DataTree();
         DataNode parent = dt.getNode("/");
         dt.createNode("/test", new byte[0], null, 0, parent.stat.getCversion() + 1, 1, 1);
         int currentCversion = parent.stat.getCversion();
@@ -193,6 +178,7 @@ public class DataTreeTest extends ZKTestCase {
 
     @Test
     public void testPzxidUpdatedWhenDeletingNonExistNode() throws Exception {
+        DataTree dt = new DataTree();
         DataNode root = dt.getNode("/");
         long currentPzxid = root.stat.getPzxid();
 
@@ -219,7 +205,10 @@ public class DataTreeTest extends ZKTestCase {
     @Test
     public void testDigestUpdatedWhenReplayCreateTxnForExistNode() {
         try {
-            DigestCalculator.setDigestEnabled(true);
+            // digestCalculator gets initialized for the new DataTree constructor based on the system property
+            ZooKeeperServer.setDigestEnabled(true);
+            DataTree dt = new DataTree();
+
             dt.processTxn(new TxnHeader(13, 1000, 1, 30, ZooDefs.OpCode.create), new CreateTxn("/foo", "".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, false, 1));
 
             // create the same node with a higher cversion to simulate the
@@ -230,7 +219,7 @@ public class DataTreeTest extends ZKTestCase {
             // check the current digest value
             assertEquals(dt.getTreeDigest(), dt.getLastProcessedZxidDigest().digest);
         } finally {
-            DigestCalculator.setDigestEnabled(false);
+            ZooKeeperServer.setDigestEnabled(false);
         }
     }
 
@@ -263,6 +252,106 @@ public class DataTreeTest extends ZKTestCase {
 
         //Check that the node path is removed from pTrie
         assertEquals("/bug is still in pTrie", "/", pTrie.findMaxPrefix("/bug"));
+    }
+
+
+    /* ZOOKEEPER-3531 - org.apache.zookeeper.server.DataTree#serialize calls the aclCache.serialize when doing
+     * dataree serialization, however, org.apache.zookeeper.server.ReferenceCountedACLCache#serialize
+     * could get stuck at OutputArchieve.writeInt due to potential network/disk issues.
+     * This can cause the system experiences hanging issues similar to ZooKeeper-2201.
+     * This test verifies the fix that we should not hold ACL cache during dumping aclcache to snapshots
+    */
+    @Test(timeout = 60000)
+    public void testSerializeDoesntLockACLCacheWhileWriting() throws Exception {
+        DataTree tree = new DataTree();
+        tree.createNode("/marker", new byte[]{42}, null, -1, 1, 1, 1);
+        final AtomicBoolean ranTestCase = new AtomicBoolean();
+        DataOutputStream out = new DataOutputStream(new ByteArrayOutputStream());
+        BinaryOutputArchive oa = new BinaryOutputArchive(out) {
+            @Override
+            public void writeInt(int size, String tag) throws IOException {
+                final Semaphore semaphore = new Semaphore(0);
+
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+
+                        synchronized (tree.getReferenceCountedAclCache()) {
+                            //When we lock ACLCache, allow writeRecord to continue
+                            semaphore.release();
+                        }
+                    }
+                }).start();
+
+                try {
+                    boolean acquired = semaphore.tryAcquire(30, TimeUnit.SECONDS);
+                    //This is the real assertion - could another thread lock
+                    //the ACLCache
+                    assertTrue("Couldn't acquire a lock on the ACLCache while we were calling tree.serialize", acquired);
+                } catch (InterruptedException e1) {
+                    throw new RuntimeException(e1);
+                }
+                ranTestCase.set(true);
+
+                super.writeInt(size, tag);
+            }
+        };
+
+        tree.serialize(oa, "test");
+
+        //Let's make sure that we hit the code that ran the real assertion above
+        assertTrue("Didn't find the expected node", ranTestCase.get());
+    }
+
+    /* ZOOKEEPER-3531 - similarly for aclCache.deserialize, we should not hold lock either
+    */
+    @Test(timeout = 60000)
+    public void testDeserializeDoesntLockACLCacheWhileReading() throws Exception {
+        DataTree tree = new DataTree();
+        tree.createNode("/marker", new byte[]{42}, null, -1, 1, 1, 1);
+        final AtomicBoolean ranTestCase = new AtomicBoolean();
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
+        BinaryOutputArchive oa = new BinaryOutputArchive(out);
+
+        tree.serialize(oa, "test");
+
+        DataTree tree2 = new DataTree();
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(baos.toByteArray()));
+        BinaryInputArchive ia = new BinaryInputArchive(in) {
+            @Override
+            public long readLong(String tag) throws IOException {
+                final Semaphore semaphore = new Semaphore(0);
+
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+
+                        synchronized (tree2.getReferenceCountedAclCache()) {
+                            //When we lock ACLCache, allow readLong to continue
+                            semaphore.release();
+                        }
+                    }
+                }).start();
+
+                try {
+                    boolean acquired = semaphore.tryAcquire(30, TimeUnit.SECONDS);
+                    //This is the real assertion - could another thread lock
+                    //the ACLCache
+                    assertTrue("Couldn't acquire a lock on the ACLCache while we were calling tree.deserialize", acquired);
+                } catch (InterruptedException e1) {
+                    throw new RuntimeException(e1);
+                }
+                ranTestCase.set(true);
+
+                return super.readLong(tag);
+            }
+        };
+
+        tree2.deserialize(ia, "test");
+
+        //Let's make sure that we hit the code that ran the real assertion above
+        assertTrue("Didn't find the expected node", ranTestCase.get());
     }
 
     /*
@@ -456,7 +545,7 @@ public class DataTreeTest extends ZKTestCase {
     public void testDigest() throws Exception {
         try {
             // enable diegst check
-            DigestCalculator.setDigestEnabled(true);
+            ZooKeeperServer.setDigestEnabled(true);
 
             DataTree dt = new DataTree();
 
@@ -487,7 +576,7 @@ public class DataTreeTest extends ZKTestCase {
             dt.deleteNode("/digesttest/1", 5);
             assertNotEquals(dt.getTreeDigest(), previousDigest);
         } finally {
-            DigestCalculator.setDigestEnabled(false);
+            ZooKeeperServer.setDigestEnabled(false);
         }
     }
 

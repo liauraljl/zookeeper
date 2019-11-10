@@ -21,7 +21,7 @@ package org.apache.zookeeper.test;
 import static org.junit.Assert.assertFalse;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.server.TraceFormatter;
+import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.quorum.Leader.Proposal;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
@@ -47,7 +47,7 @@ public class LocalSessionRequestTest extends ZKTestCase {
 
     @Before
     public void setUp() throws Exception {
-        LOG.info("STARTING quorum " + getClass().getName());
+        LOG.info("STARTING quorum {}", getClass().getName());
         qb.localSessionsEnabled = true;
         qb.localSessionsUpgradingEnabled = true;
         qb.setUp();
@@ -56,7 +56,7 @@ public class LocalSessionRequestTest extends ZKTestCase {
 
     @After
     public void tearDown() throws Exception {
-        LOG.info("STOPPING quorum " + getClass().getName());
+        LOG.info("STOPPING quorum {}", getClass().getName());
         qb.tearDown();
     }
 
@@ -83,7 +83,7 @@ public class LocalSessionRequestTest extends ZKTestCase {
         ZKDatabase db = peer.getActiveServer().getZKDatabase();
         for (Proposal p : db.getCommittedLog()) {
             assertFalse("Should not see "
-                                       + TraceFormatter.op2String(p.request.type)
+                                       + Request.op2String(p.request.type)
                                        + " request from local session 0x"
                                        + session
                                        + " on the "

@@ -55,6 +55,11 @@ public abstract class UpgradeableSessionTracker implements SessionTracker {
         return localSessionTracker != null && localSessionTracker.isTrackingSession(sessionId);
     }
 
+    @Override
+    public boolean isLocalSessionsEnabled() {
+        return localSessionsEnabled;
+    }
+
     public boolean isUpgradingSession(long sessionId) {
         return upgradingSessions != null && upgradingSessions.containsKey(sessionId);
     }
@@ -84,7 +89,7 @@ public abstract class UpgradeableSessionTracker implements SessionTracker {
         // will get the timeout from the map
         Integer timeout = localSessionsWithTimeouts.remove(sessionId);
         if (timeout != null) {
-            LOG.info("Upgrading session 0x" + Long.toHexString(sessionId));
+            LOG.info("Upgrading session 0x{}", Long.toHexString(sessionId));
             // Track global session, which will add to global session tracker
             // on leader and do nothing on learner. Need to start track global
             // session in leader now to update the session expire between

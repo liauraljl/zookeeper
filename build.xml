@@ -37,7 +37,7 @@ xmlns:cs="antlib:com.puppycrawl.tools.checkstyle.ant">
 
     <property name="audience-annotations.version" value="0.5.0" />
 
-    <property name="netty.version" value="4.1.36.Final"/>
+    <property name="netty.version" value="4.1.42.Final"/>
 
     <property name="junit.version" value="4.12"/>
     <property name="mockito.version" value="2.27.0"/>
@@ -55,7 +55,7 @@ xmlns:cs="antlib:com.puppycrawl.tools.checkstyle.ant">
     <property name="javacc.version" value="5.0"/>
 
     <property name="jetty.version" value="9.4.18.v20190429"/>
-    <property name="jackson.version" value="2.9.9.3"/>
+    <property name="jackson.version" value="2.9.10"/>
     <property name="dependency-check-ant.version" value="4.0.2"/>
 
     <property name="commons-io.version" value="2.6"/>
@@ -875,7 +875,7 @@ xmlns:cs="antlib:com.puppycrawl.tools.checkstyle.ant">
       <copy todir="${dist.dir}">
         <fileset file="CHANGES.txt"/>
         <fileset file="README.md"/>
-        <fileset file="README_packaging.txt"/>
+        <fileset file="README_packaging.md"/>
         <fileset file="build.xml"/>
         <fileset file="ivy.xml"/>
         <fileset file="ivysettings.xml"/>
@@ -1004,7 +1004,7 @@ xmlns:cs="antlib:com.puppycrawl.tools.checkstyle.ant">
       <copy todir="${dist.dir}">
         <fileset file="CHANGES.txt"/>
         <fileset file="README.md"/>
-        <fileset file="README_packaging.txt"/>
+        <fileset file="README_packaging.md"/>
         <fileset file="build.xml"/>
         <fileset file="ivy.xml"/>
         <fileset file="ivysettings.xml"/>
@@ -1760,7 +1760,7 @@ xmlns:cs="antlib:com.puppycrawl.tools.checkstyle.ant">
           <exclude name="**/wrappers*.opt"/>
           <exclude name="CHANGES.txt"/>
           <exclude name="**/README.md"/>
-          <exclude name="README_packaging.txt"/>
+          <exclude name="README_packaging.md"/>
           <exclude name="**/TODO"/>
           <exclude name="**/VERSION"/>
           <exclude name="**/ChangeLog"/>
