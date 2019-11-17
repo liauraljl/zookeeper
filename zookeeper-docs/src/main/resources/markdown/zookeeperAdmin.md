@@ -667,6 +667,15 @@ property, when available, is noted below.
     recommended to set the value to N * **preAllocSize**
     where N >= 2.
 
+* *maxCnxns* :
+    (Java system property: **zookeeper.maxCnxns**)
+    Limits the total number of concurrent connections that can be made to a
+    zookeeper server (per client Port of each server ). This is used to prevent certain
+    classes of DoS attacks. The default is 0 and setting it to 0 entirely removes
+    the limit on total number of concurrent connections.  Accounting for the
+    number of connections for serverCnxnFactory and a secureServerCnxnFactory is done
+    separately, so a peer is allowed to host up to 2*maxCnxns provided they are of appropriate types.
+
 * *maxClientCnxns* :
     (No Java system property)
     Limits the number of concurrent connections (at the socket
@@ -956,6 +965,18 @@ property, when available, is noted below.
     and restart ZooKeeper process so ZooKeeper can continue normal data
     consistency check during recovery process.
     Default value is false.
+* *audit.enable* :
+    (Java system property: **zookeeper.audit.enable**)
+    **New in 3.6.0:**
+    By default audit logs are disabled. Set to "true" to enable it. Default value is "false".
+    See the [ZooKeeper audit logs](zookeeperAuditLogs.html) for more information.
+    
+* *audit.impl.class* :
+    (Java system property: **zookeeper.audit.impl.class**)
+    **New in 3.6.0:**
+    Class to implement the audit logger. By default log4j based audit logger org.apache.zookeeper.audit
+    .Log4jAuditLogger is used.
+    See the [ZooKeeper audit logs](zookeeperAuditLogs.html) for more information.
 
 * *largeRequestMaxBytes* :
     (Java system property: **zookeeper.largeRequestMaxBytes**)
